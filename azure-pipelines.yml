@@ -1,0 +1,137 @@
+trigger:
+- master
+
+resources:
+- repo: self
+
+
+variables:
+  #Tag to use for the docker image, here we use the build ID
+  tag: '$(Build.BuildId)'
+  #Image repository name we're going to use
+  imageRepository: 'k8testapp'
+  #Namespace to deploy into on kubernetes.
+  k8sNamespaceForPR: 'review-app-$(System.PullRequest.PullRequestId)'
+
+stages:
+#First stage, build and test out application
+- stage: Build
+  displayName: Build image
+  jobs:
+  - job: Build
+    displayName: Build
+    #Only run this job if we're handling a pull-request as this is a PR example
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/pull/'))
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    #First install the code dependencies
+    - task: Npm@1
+      displayName: Install code dependencies
+      inputs:
+        command: 'install'
+        workingDir: '$(Build.Repository.LocalPath)'
+    #Run the code tests
+    - task: Npm@1
+      displayName: npm run test
+      inputs:
+        command: 'custom'
+        workingDir: '$(Build.Repository.LocalPath)'
+        customCommand: 'run test:ci'
+    #Publish the test results to Azure DevOps
+    - task: PublishTestResults@2
+      displayName: 'supply npm test results to pipelines'
+      condition: succeededOrFailed() # because otherwise we won't know what tests failed
+      inputs:
+        testResultsFiles: '$(Build.Repository.LocalPath)/junit.xml'
+    #Build our image from the instructions in the Dockerfile
+    - task: Docker@2
+      displayName: Build an image
+      inputs:
+        containerRegistry: $(containerRegistryServiceConnection)
+        repository: $(imageRepository)
+        command: 'buildAndPush'
+        Dockerfile: '**/Dockerfile'
+        tags: '$(tag)'
+        addPipelineData: false
+
+#Second stage, deploy it to kubernetes
+- stage: Production
+  displayName: Deploy stage
+  dependsOn: Build
+
+  jobs:
+  - deployment: DeployPullRequest
+    #Only run this job if we're handling a pull-request as this is a PR example
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/pull/'))
+    displayName: Deploy pull request
+    pool:
+      vmImage: ubuntu-latest
+    environment: k8testapp
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          #Checkout the code to get the kubernetes manifests
+          - checkout: self
+          #Create a Kubernetes Namespace for the deployment
+          - task: Kubernetes@1
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(kubernetesServiceConnection)
+              command: apply
+              useConfigurationFile: true
+              inline: '{ "kind": "Namespace", "apiVersion": "v1", "metadata": { "name": "$(k8sNamespaceForPR)" }}'
+          #Deploy the manifiest file to the Kubernetes cluster
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              namespace: $(k8sNamespaceForPR)
+              kubernetesServiceConnection: $(kubernetesServiceConnection)
+              action: deploy
+              manifests: |
+                manifests/k8testapp.yml
+              containers: |
+                $(containerRegistryUrl)/$(imageRepository):$(tag)
+          #Patch the deployment template metadata to add the build number as an annotation
+          - task: KubernetesManifest@0
+            displayName: Patch metadata
+            inputs:
+              namespace: $(k8sNamespaceForPR)
+              kubernetesServiceConnection: $(kubernetesServiceConnection)
+              action: patch
+              resourceToPatch: file
+              resourceFiletoPatch: manifests/k8testapp.yml
+              patch: '{"spec":{"template":{"metadata":{"annotations":{"buildNumber":"$(Build.BuildNumber)"}}}}}'
+          #Get the services in the new namespace, there should only be one
+          #so we just show the first and we change the output format to be
+          #http://<ip>:<port>
+          - task: Kubernetes@1
+            name: get
+            displayName: 'Get services in the new namespace'
+            continueOnError: true
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: $(kubernetesServiceConnection)
+              command: get
+              namespace: $(k8sNamespaceForPR)
+              arguments: svc
+              outputFormat: jsonpath='http://{.items[0].status.loadBalancer.ingress[0].ip}:{.items[0].spec.ports[0].port}'
+
+          #Use a bash script to take the output of the last command [$(get.KubectlOutput)]
+          #and post it as a message to the pull request we did this deployment for
+          #We submit it with a HTTP POST request which we authenticate with
+          #through the system access token.
+          #If this doesn't work make sure the pipeline has permissions for PRs
+          #API docs:
+          #https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull%20request%20threads?view=azure-devops-rest-4.1
+          - bash: |
+              set -e
+              BODY=$(jq --null-input \
+                --arg message "Your review app has been deployed at $(get.KubectlOutput)" \
+                '{"comments": [{"parentCommentId": 0, "content": $message, "commentType": 1}], "status": 1}'
+              )
+              URL="$SYSTEM_TEAMFOUNDATIONCOLLECTIONURI$SYSTEM_TEAMPROJECTID/_apis/git/repositories/$BUILD_REPOSITORY_NAME/pullRequests/$SYSTEM_PULLREQUEST_PULLREQUESTID/threads?api-version=4.1"
+              curl -X POST "$URL" -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H 'Content-Type: application/json' -d "$BODY" 
+            env: 
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)

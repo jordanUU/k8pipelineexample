@@ -1,0 +1,48 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: k8testapp-deployment
+  labels:
+    app: k8testapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: k8testapp
+  template:
+    metadata:
+      labels:
+        app: k8testapp
+    spec:
+      containers:
+      - name: k8testapp
+        image: com769testregsitry.azurecr.io/k8testapp:3
+        imagePullPolicy: Always
+        ports:
+          - containerPort: 31376
+        env:
+          - name: "PORT"
+            value: "31376"
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: k8testapp-service
+spec:
+  ports:
+    - name: port80
+      protocol: TCP
+      port: 80
+      targetPort: 31376
+  selector:
+    app: k8testapp
+  type: LoadBalancer
+  sessionAffinity: None
+  externalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  allocateLoadBalancerNodePorts: true
+  internalTrafficPolicy: Cluster
